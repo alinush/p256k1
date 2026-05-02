@@ -50,6 +50,10 @@ harness = false
 name = "scalar_bench"
 harness = false
 
+[[bench]]
+name = "msm_bench"
+harness = false
+
 [lib]
 path = "src/lib.rs"    # The source file of the target.
 crate-type = ["lib"]   # The crate types to generate.
