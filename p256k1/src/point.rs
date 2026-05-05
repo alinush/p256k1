@@ -31,7 +31,7 @@ use crate::{
     context::Context,
     errors::{Base58Error, ConversionError},
     field,
-    group::secp256k1_ge_set_gej,
+    group::{secp256k1_ge_set_all_gej_var, secp256k1_ge_set_gej},
     keys::PublicKey,
     scalar::Scalar,
     traits::MultiMult,
@@ -109,6 +109,7 @@ extern "C" fn error_callback(
     }
 }
 
+#[allow(dead_code)]
 struct ScalarsPoints {
     s: Vec<Scalar>,
     p: Vec<Point>,
@@ -126,6 +127,28 @@ impl MultiMult for ScalarsPoints {
     fn get_size(&self) -> usize {
         self.s.len()
     }
+}
+
+/// Holds pre-batch-normalized affine points and packed scalars for the fast
+/// `multimult` callback below. Constructed once per `multimult` call; the
+/// callback then just memcpys the i-th entries.
+struct PrenormalizedMM {
+    scalars: Vec<secp256k1_scalar>,
+    affines: Vec<secp256k1_ge>,
+}
+
+extern "C" fn prenormalized_mm_callback(
+    sc: *mut secp256k1_scalar,
+    pt: *mut secp256k1_ge,
+    idx: usize,
+    data: *mut ::std::os::raw::c_void,
+) -> ::std::os::raw::c_int {
+    unsafe {
+        let mm = &*(data as *const PrenormalizedMM);
+        *sc = mm.scalars[idx];
+        *pt = mm.affines[idx];
+    }
+    1
 }
 
 // we must mangle this because it's generic, thankfully the compiler doesn't mind passing it
@@ -211,14 +234,70 @@ impl Point {
         r
     }
 
-    /// Perform a multi-exponentiation operation on the passed scalars and points, using the Pipperger algorithm
+    /// Perform a multi-exponentiation operation on the passed scalars and points, using the Pipperger algorithm.
+    ///
+    /// Pre-batch-normalizes all input points to affine using Montgomery's
+    /// simultaneous-inversion trick (1 inversion + ~5n field muls), so the
+    /// callback invoked by `secp256k1_ecmult_multi_var` only does a memcpy
+    /// instead of a per-point Jacobian → affine inversion.
     pub fn multimult(scalars: Vec<Scalar>, points: Vec<Point>) -> Result<Point, Error> {
-        let mut sp = ScalarsPoints {
-            s: scalars,
-            p: points,
-        };
+        if scalars.len() != points.len() {
+            return Err(Error::MultiMultFailed);
+        }
+        let n = scalars.len();
 
-        Self::multimult_trait(&mut sp)
+        // Pack scalars + pre-normalize all input points to affine.
+        let raw_scalars: Vec<secp256k1_scalar> = scalars.iter().map(|s| s.scalar).collect();
+        let jacs: Vec<secp256k1_gej> = points.iter().map(|p| p.gej).collect();
+        let mut affines: Vec<secp256k1_ge> = vec![
+            secp256k1_ge {
+                x: secp256k1_fe { n: [0; 5] },
+                y: secp256k1_fe { n: [0; 5] },
+                infinity: 0,
+            };
+            n
+        ];
+        secp256k1_ge_set_all_gej_var(&mut affines, &jacs);
+
+        let mut data = PrenormalizedMM {
+            scalars: raw_scalars,
+            affines,
+        };
+        let mm_ptr: *mut c_void = &mut data as *mut _ as *mut c_void;
+
+        let zero = Scalar::zero();
+        let ctx = Context::default();
+
+        let error_callback_data = [0u8; 32];
+        let error_callback_data_ptr: *const c_void =
+            &error_callback_data as *const _ as *const c_void;
+        let multi_error_callback = secp256k1_callback {
+            fn_: Some(error_callback),
+            data: error_callback_data_ptr,
+        };
+        let multi_callback: secp256k1_ecmult_multi_callback = Some(prenormalized_mm_callback);
+
+        let mut r = Point::new();
+        unsafe {
+            // 512 bytes per element is what libsecp256k1's bench picks empirically.
+            let scratch_size = n * 512 + 1024;
+            let scratch = secp256k1_scratch_space_create(ctx.context, scratch_size);
+            let i = secp256k1_ecmult_multi_var(
+                &multi_error_callback,
+                scratch,
+                &mut r.gej,
+                &zero.scalar,
+                multi_callback,
+                mm_ptr,
+                n,
+            );
+            secp256k1_scratch_space_destroy(ctx.context, scratch);
+            if i == 0 {
+                return Err(Error::MultiMultFailed);
+            }
+        }
+
+        Ok(r)
     }
 
     /// Perform a multi-exponentiation operation on the passed object which implements the MultiMult trait, using the Pipperger algorithm
