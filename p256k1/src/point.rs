@@ -198,6 +198,19 @@ impl Point {
         }
     }
 
+    /// Variable-time size-2 multi-scalar multiplication: returns `na*p + ng*G`,
+    /// where `G` is the secp256k1 generator. This is the function ECDSA verify
+    /// and pubkey recovery internally use (`secp256k1_ecmult`), and libsecp256k1
+    /// implements it as Strauss-WNAF + GLV with a precomputed odd-multiples
+    /// table for `G`.
+    pub fn ecmult(p: &Point, na: &Scalar, ng: &Scalar) -> Point {
+        let mut r = Point::new();
+        unsafe {
+            secp256k1_ecmult(&mut r.gej, &p.gej, &na.scalar, &ng.scalar);
+        }
+        r
+    }
+
     /// Perform a multi-exponentiation operation on the passed scalars and points, using the Pipperger algorithm
     pub fn multimult(scalars: Vec<Scalar>, points: Vec<Point>) -> Result<Point, Error> {
         let mut sp = ScalarsPoints {

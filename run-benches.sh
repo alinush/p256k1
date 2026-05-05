@@ -27,6 +27,7 @@ echo "Running Criterion benchmarks (this takes ~1-2 minutes)..." >&2
 (cd "$CRATE_DIR" && cargo bench --bench msm_bench -- --quiet >/dev/null)
 
 CRIT_DIR="$TARGET_DIR/criterion/msm"
+ECMULT_DIR="$TARGET_DIR/criterion/ecmult_size2"
 
 mean_us() {
     local f="$1"
@@ -58,3 +59,11 @@ for n in 2 4 8 16 32 64 128 256 512 1024; do
             "$n" "$msm_us" "$naive_us"
     fi
 done
+
+# Separately, report the size-2 multiexp `na*P + ng*G` that ECDSA verify /
+# pubkey-recovery actually call inside libsecp256k1 (`secp256k1_ecmult`).
+# This uses a precomputed odd-multiples table for `G` and is therefore
+# faster than passing n=2 to `secp256k1_ecmult_multi_var`.
+ecmult_us=$(mean_us "$ECMULT_DIR/na_P_plus_ng_G/new/estimates.json")
+echo
+echo "ECDSA-verify-style size-2 multiexp na*P + ng*G (secp256k1_ecmult): ${ecmult_us} µs"
